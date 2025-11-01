@@ -9,9 +9,14 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <deque>
 
 constexpr unsigned long FRAMES_PER_BLOCK = 512; //Previously opened.
 using Block = std::array<int16_t, FRAMES_PER_BLOCK>; // Defining one audio block.
+
+//Global FIFO
+static std::deque<float> g_fifo;
+static constexpr size_t FIFO_MAX = 44100 * 3; //capped at 3 seconds of audio.
 
 // Minimal SPSC ring buffer.
 struct spscRing
@@ -164,10 +169,24 @@ int main()
 
             double rms = std::sqrt(acc/blk.size());
 
+            constexpr float fscale = 1.0f/32768.0f;
+            for (auto s : blk)
+            {
+                g_fifo.push_back(static_cast<float>(s) * fscale);
+            }
+
+            //Keeping FIFO bounded
+            while (g_fifo.size() > FIFO_MAX)
+            {
+                g_fifo.pop_front();
+            }
+
+            double ms = (g_fifo.size()/fs) * 1000.0;
+
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPrint).count() >= 100)
             {
-                std::printf("RMS: %.6f\n", rms);
+                std::printf("RMS: %.6f | FIFO: %zu(~%.0f ms)\n", rms, g_fifo.size(), ms);
                 lastPrint = now;
             }
             
