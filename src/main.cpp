@@ -3,6 +3,51 @@
 #include <cstdio>
 #include <cstdlib>
 
+constexpr unsigned long FRAMES_PER_BLOCK = 512; //Previously opened.
+using Block = std::array<int16_t, FRAMES_PER_BLOCK>; // Defining one audio block.
+
+// Minimal SPSC ring buffer.
+
+struct spscRing
+{
+    static constexpr size_t CAP = 64; // 2 sercond safety at 24 kHz with 512f.
+    std::array<Block, CAP> buf{};
+    std::atomic<size_t> w{0}; //ever-increasing.
+    std::atomic<size_t> r{0}; //ever-increasing.
+    std::atomic<size_t> dropped{0};
+
+    bool push(const Block &b)
+    {
+        size_t wi = w.load(std::memory_order_relaxed);
+        size_t ri = r.load(std::memory_order_acquire);
+
+        if (wi - ri >= CAP)
+        {
+            dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        buf[wi % CAP] = b;
+        w.store(wi + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(Block &out)
+    {
+        size_t ri = r.load(std::memory_order_relaxed);
+        size_t wi = w.load(std::memory_order_acquire);
+
+        if (wi == ri)
+        {
+            return false;
+        }
+
+        out = buf[ri % CAP];
+        r.store(ri + 1, std::memory_order_release);
+        return true;
+    }
+};
+
 
 static void checkPa(PaError e, const char *where)
 {
