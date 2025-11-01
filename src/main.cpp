@@ -2,12 +2,18 @@
 #include <portaudio.h>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
+#include <atomic>
+#include <cstring> //for memcpy
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <cmath>
 
 constexpr unsigned long FRAMES_PER_BLOCK = 512; //Previously opened.
 using Block = std::array<int16_t, FRAMES_PER_BLOCK>; // Defining one audio block.
 
 // Minimal SPSC ring buffer.
-
 struct spscRing
 {
     static constexpr size_t CAP = 64; // 2 sercond safety at 24 kHz with 512f.
@@ -48,6 +54,8 @@ struct spscRing
     }
 };
 
+static spscRing g_rb; //making the ring buffer instance global 
+
 
 static void checkPa(PaError e, const char *where)
 {
@@ -56,6 +64,27 @@ static void checkPa(PaError e, const char *where)
         std::fprintf(stderr, "PortAudio error at %s: %s\n", where, Pa_GetErrorText(e));
         std::exit(1);
     }
+}
+
+// PortAudio Callback
+
+static int paCallback(const void *input, void *, unsigned long frames,
+                      const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags statusFlags,
+                      void *)
+{
+    if ((statusFlags & paInputOverflow) != 0)
+    {
+
+    }
+    if (frames != FRAMES_PER_BLOCK || input == nullptr)
+    {
+        return paContinue;
+    }
+
+    Block b;
+    std::memcpy(b.data(), input, FRAMES_PER_BLOCK * sizeof(int16_t));
+    g_rb.push(b); //if full, increment dropped counter internally
+    return paContinue;
 }
 
 int main()
@@ -102,76 +131,54 @@ int main()
 
     PaStream *stream = nullptr;
 
-    checkPa(Pa_OpenStream(&stream, &in, nullptr, fs, framesPerBuffer, paNoFlag, nullptr, nullptr), "Pa_OpenStream");
+    checkPa(Pa_OpenStream(&stream, &in, nullptr, fs, FRAMES_PER_BLOCK, paNoFlag, paCallback, nullptr), "Pa_OpenStream");
 
     checkPa(Pa_StartStream(stream), "Pa_StartStream");
 
-    std::printf("Opened default input @ %.0f Hz (block %lu).\n", fs, framesPerBuffer);
-
-    std::vector<int16_t> block(framesPerBuffer);
-
-    PaError r = Pa_ReadStream(stream, block.data(), framesPerBuffer);
-    if (r == paInputOverflowed)
-    {
-        std::fprintf(stderr, "[WARN] overflow.\n");
-    }
-    else
-    {
-        checkPa(r, "Pa_ReadStream");
-    }
-
-    double acc = 0.0;
-    constexpr double scale = 1.0/32768.0;
-
-    for (auto s : block)
-    {
-        double x = s * scale;
-        acc += x * x;
-    }
-
-    double rms = std::sqrt(acc/block.size());
-
-    std::printf("One-block RMS: %.4f\n", rms);
+    std::printf("Callback running @ %.0f Hz (block %lu).\n", fs, FRAMES_PER_BLOCK);
 
     auto t0 = std::chrono::steady_clock::now();
-    auto last = t0;
-    std::vector<int16_t> block2(framesPerBuffer);
+    auto lastPrint = t0;
+    Block blk{};
+    size_t popped = 0;
 
     for (;;)
     {
-        PaError rr = Pa_ReadStream(stream, block2.data(), framesPerBuffer);
-        if (rr == paInputOverflowed)
+        if (!g_rb.pop(blk))
         {
-            std::fprintf(stderr, "[WARN] overflowed.\n");
-            continue;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-
-        checkPa(rr, "Pa_ReadStream(loop)");
-
-        double acc2 = 0.0;
-        constexpr double scale = 1.0/32768.0;
-
-        for (auto s : block2)
+        else
         {
-            double x = s * scale;
-            acc2 += x * x;
-        }
+            ++popped;
+            
+            //Computing rms values
+            double acc = 0.0;
+            constexpr double scale = 1.0/32768.0;
 
-        double rms2 = std::sqrt(acc2/block2.size());
+            for (auto s : blk)
+            {
+                double x = s * scale;
+                acc += x * x;
+            }
 
-        auto now = std::chrono::steady_clock::now();
+            double rms = std::sqrt(acc/blk.size());
 
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count() >= 100)
-        {
-            std::printf("RMS: %.6f.\n", rms2);
-            last = now;
-        }
-
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 5)
-        {
-            break;
-        }
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPrint).count() >= 100)
+            {
+                std::printf("RMS: %.6f\n", rms);
+                lastPrint = now;
+            }
+            
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 5)
+            {
+                break;
+            }
+        }        
     }
+
+    std::printf("Dropped blocks (callback): %zu.\n", g_rb.dropped.load());
 
     checkPa(Pa_StopStream(stream), "Pa_StopStream");
     checkPa(Pa_CloseStream(stream), "Pa_CloseStream");
